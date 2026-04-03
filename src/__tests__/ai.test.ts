@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 // Mock ai SDK's generateText
 vi.mock("ai", () => ({
   generateText: vi.fn(),
+  generateObject: vi.fn(),
   stepCountIs: vi.fn((n: number) => `stepCountIs(${n})`),
 }));
 
@@ -16,9 +17,9 @@ vi.mock("@ai-sdk/mcp", () => ({
   createMCPClient: vi.fn(),
 }));
 
-import { generateText } from "ai";
+import { generateText, generateObject } from "ai";
 import { createMCPClient } from "@ai-sdk/mcp";
-import { generateResponse } from "../lib/ai";
+import { generateResponse, generatePreferenceQuestions } from "../lib/ai";
 
 describe("generateResponse", () => {
   const mockTools = { search_places: {}, lookup_weather: {}, compute_routes: {} };
@@ -83,5 +84,49 @@ describe("generateResponse", () => {
 
     await generateResponse("find me a gym near Union Square");
     expect(mockClose).toHaveBeenCalled();
+  });
+});
+
+describe("generatePreferenceQuestions", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("returns 3 structured questions with options from Gemini", async () => {
+    const mockQuestions = {
+      questions: [
+        { text: "What cuisine?", options: ["Indian", "Italian", "Japanese", "Mexican"] },
+        { text: "What time?", options: ["Lunch", "Dinner", "Late night"] },
+        { text: "What vibe?", options: ["Casual", "Fancy", "Outdoor"] },
+      ],
+    };
+    vi.mocked(generateObject).mockResolvedValue({ object: mockQuestions } as any);
+
+    const result = await generatePreferenceQuestions("plan dinner tomorrow");
+
+    expect(result.questions).toHaveLength(3);
+    expect(result.questions[0].text).toBe("What cuisine?");
+    expect(result.questions[0].options.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("calls Gemini with a prompt based on the user request", async () => {
+    vi.mocked(generateObject).mockResolvedValue({
+      object: {
+        questions: [
+          { text: "Q1", options: ["A", "B"] },
+          { text: "Q2", options: ["C", "D"] },
+          { text: "Q3", options: ["E", "F"] },
+        ],
+      },
+    } as any);
+
+    await generatePreferenceQuestions("plan a morning run");
+
+    expect(generateObject).toHaveBeenCalledWith(
+      expect.objectContaining({
+        model: "gemini-model-mock",
+        prompt: expect.stringContaining("plan a morning run"),
+      })
+    );
   });
 });

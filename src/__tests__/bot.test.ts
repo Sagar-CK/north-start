@@ -11,9 +11,16 @@ vi.mock("chat", () => {
       onSubscribedMessage: vi.fn((handler: Function) => {
         handlers["onSubscribedMessage"] = handler;
       }),
+      onAction: vi.fn((handler: Function) => {
+        handlers["onAction"] = handler;
+      }),
+      openDM: vi.fn(),
       webhooks: { telegram: vi.fn() },
       _handlers: handlers,
     })),
+    Card: vi.fn(({ title, children }) => ({ type: "card", title, children })),
+    Actions: vi.fn((children) => ({ type: "actions", children })),
+    Button: vi.fn((props) => ({ type: "button", ...props })),
   };
 });
 
@@ -27,6 +34,7 @@ vi.mock("@chat-adapter/state-memory", () => ({
 
 vi.mock("../lib/ai", () => ({
   generateResponse: vi.fn(),
+  generatePreferenceQuestions: vi.fn(),
 }));
 
 import { Chat } from "chat";
@@ -50,7 +58,7 @@ describe("bot", () => {
     );
   });
 
-  it("onNewMention subscribes, calls generateResponse, and posts reply", async () => {
+  it("DM mention uses direct response flow", async () => {
     vi.mocked(generateResponse).mockResolvedValue("Here are your suggestions!");
 
     const botModule = await import("../lib/bot");
@@ -62,31 +70,44 @@ describe("bot", () => {
     const mockThread = {
       post: vi.fn(),
       subscribe: vi.fn(),
+      isDM: true,
     };
-    const mockMessage = { text: "find me a place to eat near Union Square" };
+    const mockMessage = {
+      text: "find me a place to eat near Union Square",
+      author: { userId: "alice", fullName: "Alice" },
+    };
+
+    await handler(mockThread, mockMessage);
+
+    expect(generateResponse).toHaveBeenCalledWith(
+      "find me a place to eat near Union Square"
+    );
+    expect(mockThread.post).toHaveBeenCalledWith("Here are your suggestions!");
+  });
+
+  it("group mention starts a planning session", async () => {
+    const botModule = await import("../lib/bot");
+    const bot = botModule.bot as any;
+
+    const handler = bot._handlers["onNewMention"];
+
+    const mockThread = {
+      post: vi.fn(),
+      subscribe: vi.fn(),
+      isDM: false,
+      channel: { id: "group123" },
+      id: "group123",
+    };
+    const mockMessage = {
+      text: "plan dinner tomorrow",
+      author: { userId: "alice", fullName: "Alice" },
+    };
 
     await handler(mockThread, mockMessage);
 
     expect(mockThread.subscribe).toHaveBeenCalled();
-    expect(generateResponse).toHaveBeenCalledWith("find me a place to eat near Union Square");
-    expect(mockThread.post).toHaveBeenCalledWith("Here are your suggestions!");
-  });
-
-  it("onSubscribedMessage calls generateResponse and posts reply", async () => {
-    vi.mocked(generateResponse).mockResolvedValue("More suggestions!");
-
-    const botModule = await import("../lib/bot");
-    const bot = botModule.bot as any;
-
-    const handler = bot._handlers["onSubscribedMessage"];
-    expect(handler).toBeDefined();
-
-    const mockThread = { post: vi.fn() };
-    const mockMessage = { text: "what about coffee shops?" };
-
-    await handler(mockThread, mockMessage);
-
-    expect(generateResponse).toHaveBeenCalledWith("what about coffee shops?");
-    expect(mockThread.post).toHaveBeenCalledWith("More suggestions!");
+    expect(mockThread.post).toHaveBeenCalledWith(
+      expect.stringContaining("drop your")
+    );
   });
 });

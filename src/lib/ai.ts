@@ -1,6 +1,7 @@
-import { generateText, stepCountIs } from "ai";
+import { generateText, generateObject, stepCountIs } from "ai";
 import { google } from "@ai-sdk/google";
 import { createMCPClient } from "@ai-sdk/mcp";
+import { z } from "zod/v4";
 
 const SYSTEM_PROMPT = `You are North Star — a fun, enthusiastic, and soulful local guide with the energy of OpenClaw. You LOVE helping people discover amazing places.
 
@@ -18,6 +19,38 @@ Format your reply like this:
 - End with an encouraging sign-off
 
 Keep it concise, fun, and genuinely helpful. You have soul — show it!`;
+
+const questionsSchema = z.object({
+  questions: z.array(
+    z.object({
+      text: z.string(),
+      options: z.array(z.string()),
+    })
+  ),
+});
+
+export type PreferenceQuestions = z.infer<typeof questionsSchema>;
+
+export async function generatePreferenceQuestions(
+  request: string
+): Promise<PreferenceQuestions> {
+  const result = await generateObject({
+    model: google("gemini-2.5-flash"),
+    schema: questionsSchema,
+    prompt: `You are planning a group outing. Based on this request: "${request}"
+
+Generate exactly 3 preference questions to ask the group. Each question should have 4-6 options that make sense for this type of activity.
+
+For example:
+- If the request is about dinner: cuisine type, time, vibe
+- If the request is about a run: time of day, terrain, distance
+- If the request is about an activity: type, budget, indoor/outdoor
+
+Make the options fun and specific, not generic.`,
+  });
+
+  return result.object;
+}
 
 export async function generateResponse(message: string): Promise<string> {
   console.log("[ai] generateResponse called with:", message);

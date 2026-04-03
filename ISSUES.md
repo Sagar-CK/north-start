@@ -1,101 +1,201 @@
 # Implementation Issues
 
-Parent PRD: [PRD.md](./PRD.md)
+Parent PRD: [PRD-v2.md](./PRD-v2.md)
 
 ---
 
-## Issue 1: AI Client — Gemini + Grounding Lite MCP connection
+## Issue 1: Planning Session Manager — state machine core
 
 **Type**: AFK
 **Blocked by**: None — can start immediately
 
 ### What to build
 
-Wire up the AI Client module end-to-end: configure Gemini via `@ai-sdk/google`, connect the `@ai-sdk/mcp` client to Google's Grounding Lite MCP server (`https://mapstools.googleapis.com/mcp`) using Streamable HTTP transport with the `X-Goog-Api-Key` header, write the system prompt (fun, enthusiastic OpenClaw personality; top 3 suggestions + weather + route for #1; auto walking/driving), and expose a single `generateResponse(message: string)` function.
+Pure state machine managing the full group planning lifecycle. Tracks participants, their locations (with geographic midpoint calculation), multi-select preference votes, and consensus. Handles state transitions: COLLECTING_LOCATIONS → ASKING_PREFERENCES → QUESTION_1 → QUESTION_2 → QUESTION_3 → SEARCHING → PRESENTING_RESULTS → FINAL_VOTE → DONE. Implements 30-sec reminder and 30-sec timeout logic per step. Zero Telegram or Chat SDK dependencies — pure logic module.
 
 ### Acceptance criteria
 
-- [ ] Gemini model configured via `@ai-sdk/google` using `GOOGLE_GENERATIVE_AI_API_KEY`
-- [ ] MCP client connects to Grounding Lite endpoint with API key header
-- [ ] All 3 MCP tools available to Gemini: search places, lookup weather, compute routes
-- [ ] System prompt enforces top 3 suggestions, weather, route, and personality
-- [ ] `generateResponse()` returns a complete grounded response for a location query
-- [ ] Tests verify MCP client initialization with correct endpoint and headers
-- [ ] Tests verify Gemini is called with correct system prompt and tools
-- [ ] Tests verify response includes places, weather, and route data (mocked MCP tools)
+- [ ] `createSession(groupId, request, members)` initializes a session in COLLECTING_LOCATIONS state
+- [ ] `addLocation(userId, lat, lng)` stores location and recalculates geographic midpoint
+- [ ] `addVote(userId, questionIndex, options[])` supports multi-select (multiple options per user per question)
+- [ ] `getConsensus()` returns most-tapped options across all participants, handles ties
+- [ ] `addFinalVote(userId, placeIndex)` tracks final place votes and determines winner
+- [ ] `getSessionState()` returns current state, pending participants, and collected data
+- [ ] State transitions advance correctly when all members have responded
+- [ ] Reminder triggers after 30 seconds of inactivity, identifies non-responders
+- [ ] Timeout triggers 30 seconds after reminder, proceeds with available responses
+- [ ] Tests cover: session creation, location tracking + midpoint, multi-select voting, consensus calculation, timeout/reminder transitions, full lifecycle
 
 ### User stories addressed
 
-- User stories 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 14, 15
+- User stories 2, 3, 4, 6, 7, 15
 
 ---
 
-## Issue 2: Bot Instance — Chat SDK + Telegram adapter
+## Issue 2: Dynamic Question Generator — Gemini generates preference questions
+
+**Type**: AFK
+**Blocked by**: None — can start immediately (parallel with Issue 1)
+
+### What to build
+
+Extend the AI Client with a `generatePreferenceQuestions(request: string)` function. Gemini analyzes the group's request and returns 3 preference questions with 4-6 multi-select options each as structured JSON. Also extend `generateResponse()` to accept preferences and participant locations as additional context for the final place search.
+
+### Acceptance criteria
+
+- [ ] `generatePreferenceQuestions(request)` returns `{ questions: [{ text: string, options: string[] }] }` with exactly 3 questions
+- [ ] Questions are contextually relevant (dinner → cuisine/time/vibe, run → time/terrain/distance, museum → type/time/area)
+- [ ] Each question has 4-6 options
+- [ ] `generateResponse()` accepts optional preferences and locations context
+- [ ] Tests verify Gemini called with correct prompt for question generation
+- [ ] Tests verify structured JSON response parses into valid question objects
+
+### User stories addressed
+
+- User stories 5, 16, 17
+
+---
+
+## Issue 3: Group location collection flow
 
 **Type**: AFK
 **Blocked by**: Issue 1
 
 ### What to build
 
-Create the Chat SDK instance with `@chat-adapter/telegram` and `@chat-adapter/state-memory`. Register an event handler that receives incoming Telegram messages, extracts the text, calls the AI Client's `generateResponse()`, and posts the result back to the thread.
+Wire up the bot to handle group @mentions. When @mentioned in a group, the bot creates a planning session, posts a message asking everyone to share their location (Telegram native location sharing), handles incoming location messages, pings non-responders after 30 seconds, and proceeds after a second 30-second timeout. Detect group vs DM context — existing 1:1 flow continues to work in private chats.
 
 ### Acceptance criteria
 
-- [ ] Chat SDK instance created with Telegram adapter and in-memory state
-- [ ] Bot token configured via `TELEGRAM_BOT_TOKEN` environment variable
-- [ ] Event handler triggers on new messages
-- [ ] Handler passes message text to AI Client and posts response back
-- [ ] Tests verify handler calls AI Client with correct message text
-- [ ] Tests verify AI Client response is posted back to the thread
+- [ ] Bot detects @mention in a group chat and creates a new planning session
+- [ ] Bot posts "Share your location!" message to the group
+- [ ] Bot receives Telegram location messages and feeds lat/lng into the session manager
+- [ ] Bot pings non-responders by name after 30 seconds: "@name still waiting on you!"
+- [ ] Bot proceeds with collected locations after another 30 seconds
+- [ ] Existing 1:1 DM flow (`onNewMention` + `onSubscribedMessage`) still works in private chats
+- [ ] Bot correctly detects group member count via Telegram API
 
 ### User stories addressed
 
-- User stories 1, 10, 11, 12
+- User stories 1, 2, 3, 4
 
 ---
 
-## Issue 3: Webhook Route — Next.js API endpoint
+## Issue 4: Preference voting with inline keyboards
 
 **Type**: AFK
-**Blocked by**: Issue 2
+**Blocked by**: Issue 1, Issue 2, Issue 3
 
 ### What to build
 
-Create the Next.js API route at `/api/telegram` that receives Telegram webhook POSTs and delegates to the Chat SDK's `bot.webhooks.telegram` handler. This is pure glue code connecting the HTTP layer to the bot.
+After locations are collected, the bot calls `generatePreferenceQuestions()` to get 3 dynamic questions, then posts them one at a time as Chat SDK Cards with multi-select inline keyboard buttons. Users tap multiple options per question. Bot tracks votes via `onAction` handler, feeds them into the session manager. 30-sec reminder + timeout per question. After all 3 questions, bot calculates consensus.
 
 ### Acceptance criteria
 
-- [ ] POST handler at `/api/telegram/route.ts`
-- [ ] Delegates request/response to Chat SDK webhook handler
-- [ ] Returns appropriate status codes (200 on success)
-- [ ] Bot fully initializes on first request
+- [ ] Bot calls `generatePreferenceQuestions()` with the original group request
+- [ ] Each question renders as a Card with inline keyboard buttons (4-6 options)
+- [ ] Users can tap multiple buttons per question (multi-select)
+- [ ] Bot visually acknowledges each tap (e.g., updates button or posts confirmation)
+- [ ] 30-sec reminder pings non-voters, proceeds after another 30 sec
+- [ ] After question 3, bot calculates consensus from overlapping multi-select votes
+- [ ] Bot transitions to search phase with collected preferences
 
 ### User stories addressed
 
-- User stories 1, 11
+- User stories 5, 6, 7, 16, 17, 20
 
 ---
 
-## Issue 4: End-to-end smoke test via ngrok + Telegram
+## Issue 5: Search + results with place link buttons
 
-**Type**: HITL
-**Blocked by**: Issue 3
+**Type**: AFK
+**Blocked by**: Issue 4
 
 ### What to build
 
-Verify the entire flow works end-to-end: expose the local Next.js dev server via ngrok, set the Telegram bot webhook to the ngrok URL, send real messages from Telegram, and verify the bot responds with place suggestions, weather, and route details. Tune the system prompt based on actual response quality.
+Take consensus preferences + participant locations, call Grounding Lite to find the best places. Use `search_places` with `locationBias` centered at the geographic midpoint of all participants. Use `lookup_weather` for the requested date/time (hourly if within 48hrs, daily otherwise). Use `compute_routes` from each participant's location to each place. Post 3 separate messages to the group — one per place — each with place name, AI summary, weather, and inline keyboard URL buttons (directions, photos, reviews from `googleMapsLinks`).
 
 ### Acceptance criteria
 
-- [ ] ngrok exposes local server with stable URL
-- [ ] Telegram webhook set to `https://<ngrok-url>/api/telegram`
-- [ ] Bot responds to "find me a place to eat near Union Square" with 3 suggestions
-- [ ] Response includes weather details for the area
-- [ ] Response includes route details (distance + duration) to top suggestion
-- [ ] Bot personality feels fun and enthusiastic
-- [ ] Bot handles different query types (parks, coffee, activities, etc.)
-- [ ] Bot handles follow-up messages in conversation
+- [ ] `search_places` called with `locationBias` at geographic midpoint of all participants
+- [ ] `lookup_weather` called for the specific date/time from the request
+- [ ] `compute_routes` called per participant per place (walking if < 2km, driving otherwise)
+- [ ] 3 separate messages posted to group, one per place
+- [ ] Each message includes: place name, AI summary, weather for requested time
+- [ ] Each message has inline keyboard URL buttons: "Directions", "Photos", "Reviews"
+- [ ] Weather is factored into place selection (indoor spots for rain, etc.)
 
 ### User stories addressed
 
-- All user stories (1-15)
+- User stories 8, 9, 10, 15, 18, 19
+
+---
+
+## Issue 6: DM individual routes with group fallback
+
+**Type**: AFK
+**Blocked by**: Issue 5
+
+### What to build
+
+After the 3 place messages are posted, the bot DMs each participant their personal route details for all 3 places: walking vs driving (auto-selected by distance), distance in meters/km, and estimated duration. If the DM fails (user hasn't /started the bot), fall back to posting that person's routes in the group chat.
+
+### Acceptance criteria
+
+- [ ] Bot attempts to DM each participant via Telegram Bot API
+- [ ] DM includes route details for all 3 places from that person's location
+- [ ] Walking auto-selected for < 2km, driving otherwise
+- [ ] If DM fails, bot posts that person's routes in the group chat instead
+- [ ] No error or stall if some DMs succeed and others fail
+
+### User stories addressed
+
+- User stories 11, 12, 19
+
+---
+
+## Issue 7: Final group vote
+
+**Type**: AFK
+**Blocked by**: Issue 5
+
+### What to build
+
+After the 3 place messages are posted, bot sends a "Vote for your favorite!" message with inline keyboard buttons for Place 1, Place 2, and Place 3. Tallies votes from group members using the session manager's `addFinalVote()`. Once all members have voted (or timeout), announces the winner with an enthusiastic message.
+
+### Acceptance criteria
+
+- [ ] Bot posts "Vote for your favorite!" with 3 place buttons after results
+- [ ] Each group member can vote for one place
+- [ ] 30-sec reminder + timeout for non-voters
+- [ ] Bot announces the winning place with an enthusiastic message
+- [ ] Ties broken (most votes wins, random on tie)
+- [ ] Session transitions to DONE state
+
+### User stories addressed
+
+- User stories 13, 14, 20
+
+---
+
+## Issue 8: End-to-end smoke test in group chat
+
+**Type**: HITL
+**Blocked by**: Issue 6, Issue 7
+
+### What to build
+
+Full end-to-end test in a real Telegram group chat. Add the bot to a group, @mention it with a planning request, verify the entire flow works: location collection → dynamic preference questions → multi-select voting → place results with inline URL buttons → DM routes → final group vote → winner announcement. Tune system prompt and timing based on real usage.
+
+### Acceptance criteria
+
+- [ ] Bot responds to @mention in group chat and starts planning flow
+- [ ] Location sharing works via Telegram native feature
+- [ ] 30-sec reminders fire for non-responders
+- [ ] Preference questions are contextually relevant to the request
+- [ ] Multi-select voting works (multiple taps per question)
+- [ ] 3 place messages posted with working inline URL buttons (directions, photos, reviews)
+- [ ] Individual route DMs sent (or group fallback)
+- [ ] Final vote works and winner is announced
+- [ ] Existing 1:1 DM flow still works
+- [ ] Bot personality feels fun and enthusiastic throughout
