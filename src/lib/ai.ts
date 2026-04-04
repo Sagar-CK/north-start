@@ -3,43 +3,41 @@ import { google } from "@ai-sdk/google";
 import { createMCPClient } from "@ai-sdk/mcp";
 import { z } from "zod/v4";
 
-const SYSTEM_PROMPT = `You are North Star -- a fun, enthusiastic, and soulful local guide with the energy of OpenClaw. You LOVE helping people discover amazing places.
+const SYSTEM_PROMPT = `You are North Star -- a warm, witty local guide who genuinely loves helping people find great spots. You talk like a friend who just moved to the city and can't stop telling everyone about the gems you've found.
 
-IMPORTANT FORMATTING RULES:
-- Do NOT use emojis anywhere in your response.
-- Do NOT use markdown formatting (no **, no ##, no *) EXCEPT for links.
-- For links, use markdown link syntax: [Link Text](URL). Never show raw URLs.
-- Use plain dashes (-) for lists.
+Your personality:
+- Conversational and human -- like texting a friend, not reading a brochure
+- You have real opinions and aren't afraid to share them
+- You notice the little details that make a place special
+- You're excited but not over-the-top
 
 When someone asks for a recommendation:
+1. Use search_places to find the top 3 spots near the specified location.
+2. Use lookup_weather for the weather at the requested time.
+3. Use compute_routes from each user's location. Walk if < 2km, drive otherwise.
 
-1. Use the search_places tool to find the top 3 suggestions near the specified location.
-2. Use the lookup_weather tool to get today's weather for the area.
-3. Use the compute_routes tool to get directions from each user's location. Choose walking if distance < 2km, driving otherwise.
+IMPORTANT: Return your response as valid JSON matching this exact schema:
+{
+  "weather": "short weather summary, like: 72F and sunny, perfect evening out",
+  "intro": "a one-line conversational opener about the search, like a friend would say",
+  "places": [
+    {
+      "name": "Place Name",
+      "vibe": "a short, vivid, human description -- what makes this place special. 1-2 sentences max. Sound like you've actually been there.",
+      "rating": "4.5/5" or null,
+      "googleMapsUrl": "url",
+      "directionsUrl": "url",
+      "photosUrl": "url",
+      "reviewsUrl": "url",
+      "routes": [
+        { "userName": "name", "mode": "walk or drive", "distance": "0.8 km", "duration": "12 min" }
+      ]
+    }
+  ],
+  "signoff": "a short, warm closing line -- like a friend sending you off"
+}
 
-Format your reply EXACTLY like this:
-
-Weather: [temperature, conditions for the requested time]
-
-Option 1: [Place Name]
-[One-line description]
-Rating: [if available]
-[Google Maps](placeUrl) | [Directions](directionsUrl) | [Photos](photosUrl) | [Reviews](reviewsUrl)
-
-Option 2: [Place Name]
-[One-line description]
-Rating: [if available]
-[Google Maps](placeUrl) | [Directions](directionsUrl) | [Photos](photosUrl) | [Reviews](reviewsUrl)
-
-Option 3: [Place Name]
-[One-line description]
-Rating: [if available]
-[Google Maps](placeUrl) | [Directions](directionsUrl) | [Photos](photosUrl) | [Reviews](reviewsUrl)
-
-Route details:
-[For each user, show distance and duration to each option]
-
-Always include ALL Google Maps links returned by the search_places tool. Be concise, fun, and genuinely helpful.`;
+Make the vibe descriptions feel real and specific. Not "great Italian restaurant" but "the kind of place where the pasta is handmade and the owner will come chat with you about his grandmother's recipe."`;
 
 const questionsSchema = z.object({
   questions: z.array(
@@ -51,6 +49,33 @@ const questionsSchema = z.object({
 });
 
 export type PreferenceQuestions = z.infer<typeof questionsSchema>;
+
+const placesResponseSchema = z.object({
+  weather: z.string(),
+  intro: z.string(),
+  places: z.array(
+    z.object({
+      name: z.string(),
+      vibe: z.string(),
+      rating: z.string().nullable(),
+      googleMapsUrl: z.string().optional(),
+      directionsUrl: z.string().optional(),
+      photosUrl: z.string().optional(),
+      reviewsUrl: z.string().optional(),
+      routes: z.array(
+        z.object({
+          userName: z.string(),
+          mode: z.string(),
+          distance: z.string(),
+          duration: z.string(),
+        })
+      ).optional(),
+    })
+  ),
+  signoff: z.string(),
+});
+
+export type PlacesResponse = z.infer<typeof placesResponseSchema>;
 
 export async function generatePreferenceQuestions(
   request: string
@@ -77,10 +102,9 @@ Examples of good question sets:
   return result.object;
 }
 
-export async function generateResponse(message: string): Promise<string> {
-  console.log("[ai] generateResponse called with:", message);
+export async function generatePlacesResponse(message: string): Promise<PlacesResponse> {
+  console.log("[ai] generatePlacesResponse called");
 
-  console.log("[ai] Connecting to Grounding Lite MCP server...");
   const mcpClient = await createMCPClient({
     transport: {
       type: "http",
@@ -90,7 +114,6 @@ export async function generateResponse(message: string): Promise<string> {
       },
     },
   });
-  console.log("[ai] MCP client connected");
 
   try {
     const tools = await mcpClient.tools();
@@ -105,13 +128,52 @@ export async function generateResponse(message: string): Promise<string> {
     });
 
     console.log("[ai] Gemini response received, length:", result.text.length);
-    console.log("[ai] Steps taken:", result.steps?.length ?? "unknown");
+
+    // Parse the JSON from the response
+    const jsonMatch = result.text.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      return placesResponseSchema.parse(JSON.parse(jsonMatch[0]));
+    }
+
+    // Fallback: try parsing the whole thing
+    return placesResponseSchema.parse(JSON.parse(result.text));
+  } catch (error) {
+    console.error("[ai] Error generating places response:", error);
+    throw error;
+  } finally {
+    await mcpClient.close();
+  }
+}
+
+export async function generateResponse(message: string): Promise<string> {
+  console.log("[ai] generateResponse called with:", message);
+
+  const mcpClient = await createMCPClient({
+    transport: {
+      type: "http",
+      url: "https://mapstools.googleapis.com/mcp",
+      headers: {
+        "X-Goog-Api-Key": process.env.MAPS_GROUNDING_LITE_API_KEY!,
+      },
+    },
+  });
+
+  try {
+    const tools = await mcpClient.tools();
+
+    const result = await generateText({
+      model: google("gemini-2.5-flash"),
+      system: SYSTEM_PROMPT,
+      prompt: message,
+      tools,
+      stopWhen: stepCountIs(5),
+    });
+
     return result.text;
   } catch (error) {
     console.error("[ai] Error generating response:", error);
     throw error;
   } finally {
     await mcpClient.close();
-    console.log("[ai] MCP client closed");
   }
 }

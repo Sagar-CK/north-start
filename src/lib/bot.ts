@@ -1,7 +1,8 @@
 import { Chat, Card, Actions, Button } from "chat";
 import { createTelegramAdapter } from "@chat-adapter/telegram";
 import { createMemoryState } from "@chat-adapter/state-memory";
-import { generateResponse, generatePreferenceQuestions } from "./ai";
+import { generateResponse, generatePreferenceQuestions, generatePlacesResponse } from "./ai";
+import type { PlacesResponse } from "./ai";
 import {
   createSession,
   addLocation,
@@ -51,9 +52,9 @@ function scheduleReminder(
 
     const timeoutTimer = setTimeout(() => {
       onTimeout();
-    }, 30_000);
+    }, 8_000);
     timers.set(groupId, timeoutTimer);
-  }, 30_000);
+  }, 8_000);
 
   timers.set(groupId, reminderTimer);
 }
@@ -62,7 +63,7 @@ async function postMissingReminder(thread: any, session: Session) {
   const missing = getMissingParticipants(session);
   if (missing.length > 0) {
     const names = missing.map((id) => userNames.get(id) || id).join(", ");
-    await thread.post(`Still waiting on: ${names} -- don't leave us hanging!`);
+    await thread.post(`⏳ Still waiting on ${names} -- come on, don't be shy!`);
     sessions.set(session.groupId, markReminderSent(session));
   }
 }
@@ -94,7 +95,7 @@ async function handlePreferencePhase(thread: any, session: Session) {
   const groupId = session.groupId;
   console.log("[bot] Starting preference phase for", groupId);
 
-  await thread.post("Got the locations. Now a few quick questions...");
+  await thread.post("📍 Got everyone's spots! Now let me ask a few quick questions so I can find something perfect for you all...");
 
   try {
     const { questions } = await generatePreferenceQuestions(session.request);
@@ -105,7 +106,7 @@ async function handlePreferencePhase(thread: any, session: Session) {
   } catch (error) {
     console.error("[bot] Error generating preference questions:", error);
     await thread.post(
-      "Had trouble thinking up questions -- searching directly instead."
+      "Hmm, had some trouble there -- let me just search for you directly."
     );
     await handleSearchPhase(thread, session);
   }
@@ -121,27 +122,19 @@ async function postQuestion(
 
   const groupId = session.groupId;
 
+  // Post question as markdown, then buttons as a card
+  await thread.post({ markdown: `❓ *${question.text}*` });
   await thread.post(
     Card({
-      title: `${question.text}\n\nTap all that work, then hit Done:`,
-      children: [
-        ...question.options.map((opt: string, optIdx: number) =>
-          Actions([
-            Button({
-              id: `v:${questionIndex}:${optIdx}`,
-              label: opt,
-              style: "primary",
-            }),
-          ])
-        ),
+      children: question.options.map((opt: string, optIdx: number) =>
         Actions([
           Button({
-            id: `d:${questionIndex}`,
-            label: "Done",
-            style: "danger",
+            id: `v:${questionIndex}:${optIdx}`,
+            label: opt,
+            style: "primary",
           }),
-        ]),
-      ],
+        ])
+      ),
     })
   );
 
@@ -187,7 +180,7 @@ async function handleQuestionAdvance(
 
 async function handleSearchPhase(thread: any, session: Session) {
   console.log("[bot] Starting search phase");
-  await thread.post("Searching for the best spots for everyone...");
+  await thread.post("Alright, give me a sec -- finding the best spots for you all...");
 
   const consensus = getConsensus(session);
   const preferenceSummary = consensus
@@ -212,19 +205,65 @@ ${Object.entries(session.locations)
 Choose walking if distance < 2km, driving otherwise.`;
 
   try {
-    const response = await generateResponse(prompt);
+    const data = await generatePlacesResponse(prompt);
 
-    // Post the full response to the group
-    await thread.post(response);
+    // Weather + intro
+    await thread.post(`🌤 ${data.weather}\n\n${data.intro}`);
 
-    // Post final vote with simple Option 1/2/3 buttons
+    // Post each place as a beautiful card
+    const medals = ["🥇", "🥈", "🥉"];
+    for (let i = 0; i < data.places.length && i < 3; i++) {
+      const place = data.places[i];
+      await postPlaceCard(thread, place, i, medals[i]);
+    }
+
+    // Sign-off
+    await thread.post(data.signoff);
+
+    // Final vote
     await handleFinalVote(thread, session);
   } catch (error) {
     console.error("[bot] Error in search phase:", error);
-    await thread.post(
-      "Hit a snag searching -- try again with a more specific request."
-    );
+    // Fallback to plain text
+    try {
+      const response = await generateResponse(prompt);
+      await thread.post(response);
+      await handleFinalVote(thread, session);
+    } catch {
+      await thread.post("Hit a snag searching -- try @mentioning me again with a more specific request.");
+    }
   }
+}
+
+async function postPlaceCard(thread: any, place: PlacesResponse["places"][0], index: number, medal: string) {
+  // Build the message text as markdown
+  let text = `${medal} *Option ${index + 1}: ${place.name}*\n\n`;
+  text += `${place.vibe}\n`;
+  if (place.rating) {
+    text += `\nRating: ${place.rating}`;
+  }
+
+  // Route summary
+  const routes = place.routes || [];
+  if (routes.length > 0) {
+    text += `\n\nGetting there:`;
+    for (const r of routes) {
+      text += `\n  ${r.userName}: ${r.duration} ${r.mode} (${r.distance})`;
+    }
+  }
+
+  // Add links as markdown
+  const links: string[] = [];
+  if (place.googleMapsUrl) links.push(`[Open in Maps](${place.googleMapsUrl})`);
+  if (place.directionsUrl) links.push(`[Directions](${place.directionsUrl})`);
+  if (place.photosUrl) links.push(`[Photos](${place.photosUrl})`);
+  if (place.reviewsUrl) links.push(`[Reviews](${place.reviewsUrl})`);
+
+  if (links.length > 0) {
+    text += `\n\n${links.join(" | ")}`;
+  }
+
+  await thread.post({ markdown: text });
 }
 
 async function handleFinalVote(thread: any, session: Session) {
@@ -232,9 +271,9 @@ async function handleFinalVote(thread: any, session: Session) {
   const updated = { ...session, state: "FINAL_VOTE" as const };
   sessions.set(groupId, updated);
 
+  await thread.post({ markdown: "🏆 *Alright, time to pick -- vote for your favorite!*" });
   await thread.post(
     Card({
-      title: "Vote for your favorite:",
       children: [
         Actions([
           Button({ id: "f:0", label: "Option 1", style: "primary" }),
@@ -277,7 +316,7 @@ async function announceWinner(thread: any, session: Session) {
   timers.delete(session.groupId);
 
   await thread.post(
-    `The people have spoken -- Option ${winner + 1} wins! Go have an amazing time.`
+    `🎉 And the winner is... Option ${winner + 1}! That's a great pick honestly. Go have an incredible time, you all deserve it.`
   );
 }
 
@@ -305,7 +344,7 @@ bot.onNewMention(async (thread, message) => {
       if (timer) clearTimeout(timer);
       timers.delete(groupId);
       sessions.delete(groupId);
-      await thread.post("Cleared. Mention me again to start fresh.");
+      await thread.post("✨ All cleared! Mention me whenever you're ready to go again.");
     } else {
       await thread.post("Nothing to clear. Mention me to start planning.");
     }
@@ -322,7 +361,7 @@ bot.onNewMention(async (thread, message) => {
   await thread.subscribe();
 
   await thread.post(
-    "Let's plan this together.\n\nFirst -- everyone share your location so I can find the best spot for the whole group."
+    "Hey hey! 👋 Let's make this happen.\n\nFirst things first -- everyone drop your 📍 location so I can find a spot that works for the whole crew."
   );
 
   handleLocationPhase(thread, session);
@@ -360,13 +399,7 @@ bot.onSubscribedMessage(async (thread, message) => {
       updated = addLocation(updated, userId, loc.latitude, loc.longitude);
       sessions.set(groupId, updated);
 
-      await thread.post(`Got ${message.author.fullName}'s location.`);
-
-      const advanced = advanceState(updated);
-      if (advanced.state !== updated.state) {
-        sessions.set(groupId, advanced);
-        handlePreferencePhase(thread, advanced);
-      }
+      await thread.post(`📍 Got ${message.author.fullName}'s location!`);
     }
   }
 });
@@ -405,64 +438,26 @@ async function handleVoteAction(
   const thread = event.thread;
 
   if (buttonId.startsWith("v:")) {
+    // Single select -- one pick per person per question
     const parts = buttonId.split(":");
     const questionIndex = parseInt(parts[1], 10);
     const optionIndex = parseInt(parts[2], 10);
     const option = session.questions[questionIndex]?.options[optionIndex] ?? `option-${optionIndex}`;
 
-    const existingVotes =
-      session.votes[questionIndex]?.[userId] ?? [];
-    if (!existingVotes.includes(option)) {
-      const updated = addVote(session, userId, questionIndex, [
-        ...existingVotes,
-        option,
-      ]);
+    let updated = addVote(session, userId, questionIndex, [option]);
 
-      if (!updated.members.includes(userId)) {
-        updated.members = [...updated.members, userId];
-      }
-
-      sessions.set(groupId, updated);
-      console.log(
-        `[bot] Vote from ${userNames.get(userId) || userId}: Q${questionIndex} = ${option}`
-      );
+    if (!updated.members.includes(userId)) {
+      updated = { ...updated, members: [...updated.members, userId] };
     }
 
-    const current = sessions.get(groupId)!;
-    const advanced = advanceState(current);
-    if (advanced.state !== current.state) {
-      sessions.set(groupId, advanced);
-
-      const completedIndex =
-        current.state === "QUESTION_1"
-          ? 0
-          : current.state === "QUESTION_2"
-            ? 1
-            : 2;
-      if (thread) {
-        await handleQuestionAdvance(thread, advanced, completedIndex);
-      }
-    }
-  } else if (buttonId.startsWith("d:")) {
-    // "Done" button -- force advance to next question
-    const questionIndex = parseInt(buttonId.split(":")[1], 10);
-    const current = sessions.get(groupId)!;
-    const advanced = forceAdvance(current);
-    if (advanced.state !== current.state) {
-      sessions.set(groupId, advanced);
-      if (thread) {
-        await handleQuestionAdvance(thread, advanced, questionIndex);
-      }
-    }
+    sessions.set(groupId, updated);
+    console.log(
+      `[bot] Vote from ${userNames.get(userId) || userId}: Q${questionIndex} = ${option}`
+    );
   } else if (buttonId.startsWith("f:")) {
     const placeIndex = parseInt(buttonId.split(":")[1], 10);
     const updated = addFinalVote(session, userId, placeIndex);
     sessions.set(groupId, updated);
     console.log(`[bot] Final vote from ${userNames.get(userId) || userId}: Option ${placeIndex + 1}`);
-
-    const advanced = advanceState(updated);
-    if (advanced.state === "DONE" && thread) {
-      announceWinner(thread, updated);
-    }
   }
 }
