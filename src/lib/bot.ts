@@ -19,7 +19,7 @@ import {
 export const bot = new Chat({
   userName: "northstar",
   adapters: {
-    telegram: createTelegramAdapter(),
+    telegram: createTelegramAdapter({ mode: "webhook" }),
   },
   state: createMemoryState(),
 });
@@ -95,12 +95,14 @@ async function handlePreferencePhase(thread: any, session: Session) {
   const groupId = session.groupId;
   console.log("[bot] Starting preference phase for", groupId);
 
+  await thread.post("Got everyone's locations! Now let me ask a few quick questions... 🤔");
+
   try {
     const { questions } = await generatePreferenceQuestions(session.request);
-    let updated = { ...session, state: "QUESTION_1" as const, questions };
+    const updated = { ...session, state: "QUESTION_1" as const, questions };
     sessions.set(groupId, updated);
 
-    // Post questions one at a time — start with question 1
+    // Post ONLY question 1 — next questions post after this one completes
     await postQuestion(thread, updated, 0);
   } catch (error) {
     console.error("[bot] Error generating preference questions:", error);
@@ -124,24 +126,21 @@ async function postQuestion(
   // Post question with buttons
   // Using Chat SDK Card with buttons for inline keyboard
 
+  // Post each button as its own row so Telegram doesn't truncate labels
   await thread.post(
     Card({
-      title: `❓ ${question.text}`,
-      children: [
-        Actions(
-          question.options.map((opt: string) =>
-            Button({
-              id: `vote:${questionIndex}:${opt}`,
-              label: opt,
-              style: "primary",
-            })
-          )
-        ),
-      ],
+      title: `❓ ${question.text}\n\nTap all that work for you!`,
+      children: question.options.map((opt: string, optIdx: number) =>
+        Actions([
+          Button({
+            id: `v:${questionIndex}:${optIdx}`,
+            label: opt,
+            style: "primary",
+          }),
+        ])
+      ),
     })
   );
-
-  await thread.post("Tap all that work for you! Multi-select is ON 🔥");
 
   scheduleReminder(
     groupId,
@@ -166,13 +165,21 @@ async function handleQuestionAdvance(
   session: Session,
   completedQuestionIndex: number
 ) {
+  const groupId = session.groupId;
   const nextIndex = completedQuestionIndex + 1;
+
   if (nextIndex < 3 && nextIndex < session.questions.length) {
-    await postQuestion(thread, session, nextIndex);
+    // Update state to next question before posting
+    const questionState = `QUESTION_${nextIndex + 1}` as const;
+    const updated = { ...session, state: questionState as Session["state"] };
+    sessions.set(groupId, updated);
+
+    console.log(`[bot] Moving to question ${nextIndex + 1}`);
+    await postQuestion(thread, updated, nextIndex);
   } else {
     // All questions done — move to search
     const searching = { ...session, state: "SEARCHING" as const };
-    sessions.set(session.groupId, searching);
+    sessions.set(groupId, searching);
     await handleSearchPhase(thread, searching);
   }
 }
@@ -261,9 +268,9 @@ async function handleFinalVote(thread: any, session: Session) {
       title: "🏆 Vote for your favorite!",
       children: [
         Actions([
-          Button({ id: "final:0", label: "Place #1", style: "primary" }),
-          Button({ id: "final:1", label: "Place #2", style: "primary" }),
-          Button({ id: "final:2", label: "Place #3", style: "primary" }),
+          Button({ id: "f:0", label: "Place #1", style: "primary" }),
+          Button({ id: "f:1", label: "Place #2", style: "primary" }),
+          Button({ id: "f:2", label: "Place #3", style: "primary" }),
         ]),
       ],
     })
@@ -315,8 +322,24 @@ bot.onNewMention(async (thread, message) => {
     return;
   }
 
-  // Group mention — start planning session
   const groupId = getGroupId(thread);
+
+  // Handle /clear command
+  if (message.text.includes("/clear")) {
+    const existing = sessions.get(groupId);
+    if (existing) {
+      const timer = timers.get(groupId);
+      if (timer) clearTimeout(timer);
+      timers.delete(groupId);
+      sessions.delete(groupId);
+      await thread.post("Cleared! Slate is clean — @mention me again whenever you're ready to start fresh. ✨");
+    } else {
+      await thread.post("Nothing to clear — we're all good! @mention me to start planning.");
+    }
+    return;
+  }
+
+  // Group mention — start planning session
   console.log("[bot] Group mention in", groupId, "— starting planning session");
 
   const session = createSession(groupId, message.text, [
@@ -408,11 +431,12 @@ async function handleVoteAction(
   const userId = event.user?.userId ?? "unknown";
   const thread = event.thread;
 
-  if (buttonId.startsWith("vote:")) {
-    // Preference vote: vote:questionIndex:option
+  if (buttonId.startsWith("v:")) {
+    // Preference vote: v:questionIndex:optionIndex
     const parts = buttonId.split(":");
     const questionIndex = parseInt(parts[1], 10);
-    const option = parts.slice(2).join(":");
+    const optionIndex = parseInt(parts[2], 10);
+    const option = session.questions[questionIndex]?.options[optionIndex] ?? `option-${optionIndex}`;
 
     // Add to existing votes (multi-select)
     const existingVotes =
@@ -450,7 +474,7 @@ async function handleVoteAction(
         await handleQuestionAdvance(thread, advanced, completedIndex);
       }
     }
-  } else if (buttonId.startsWith("final:")) {
+  } else if (buttonId.startsWith("f:")) {
     const placeIndex = parseInt(buttonId.split(":")[1], 10);
     const updated = addFinalVote(session, userId, placeIndex);
     sessions.set(groupId, updated);
