@@ -107,7 +107,7 @@ describe("bot", () => {
 
     expect(mockThread.subscribe).toHaveBeenCalled();
     expect(mockThread.post).toHaveBeenCalledWith(
-      expect.stringContaining("drop your")
+      expect.stringContaining("share your location")
     );
   });
 });
